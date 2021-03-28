@@ -1,168 +1,235 @@
-import numpy as np
-from collections import namedtuple
-import json
-import tensorflow as tf
-from tensorflow_probability import distributions as tfd
-import tensorflow_probability as tfp
+from argparse import Namespace
+from enum import IntFlag
 
-# controls whether we concatenate (z, c, h), etc for features used for car.
-MODE_ZCH = 0
-MODE_ZC = 1
-MODE_Z = 2
-MODE_Z_HIDDEN = 3 # extra hidden later
-MODE_ZH = 4
+import numpy as np
+import tensorflow as tf
+import tensorflow_probability as tfp
+from tensorflow_probability import distributions as tfd
+
+from losses import masked_gaussian_mixture, masked_bce, masked_mse, masked_bool_statistic, masked_bool_logvar
+
+
+class FeatureMode(IntFlag):
+    """
+    Determines which features are used to train the controller.
+    z: Encoding (from the Autoencoder)
+    h: Hidden state (LSTM output)
+    c: Cell state (LSTM state)
+    """
+    INCLUDE_Z = 2 ** 0
+    INCLUDE_C = 2 ** 1
+    INCLUDE_H = 2 ** 2
+    MODE_ZCH = INCLUDE_Z | INCLUDE_C | INCLUDE_H
+    MODE_ZH = INCLUDE_Z | INCLUDE_H
+    MODE_ZC = INCLUDE_Z | INCLUDE_C
+    MODE_Z = INCLUDE_Z
+
+    @classmethod
+    def _missing_(cls, value):
+        if isinstance(value, str):
+            return cls.from_str(value)
+        return super()._missing_(value)
+
+    @staticmethod
+    def from_str(value: str):
+        value = value.upper()
+        return FeatureMode[value]
+
 
 @tf.function
 def sample_vae(vae_mu, vae_logvar):
     sz = vae_mu.shape[1]
     mu_logvar = tf.concat([vae_mu, vae_logvar], axis=1)
-    z = tfp.layers.DistributionLambda(lambda theta: tfp.distributions.MultivariateNormalDiag(loc=theta[:, :sz], scale_diag=tf.exp(theta[:, sz:])), dtype=tf.float16)
+    z = tfp.layers.DistributionLambda(
+        lambda theta: tfp.distributions.MultivariateNormalDiag(loc=theta[:, :sz], scale_diag=tf.exp(theta[:, sz:])),
+        dtype=tf.float16
+    )  # TODO: Don't instantiate new layer each time
     return z(mu_logvar)
 
+
 class MDNRNN(tf.keras.Model):
-    def __init__(self, args):
+    def __init__(self, args: Namespace):
         super(MDNRNN, self).__init__()
         self.args = args
-        self.optimizer = tf.keras.optimizers.Adam(learning_rate=self.args.rnn_learning_rate, clipvalue=self.args.rnn_grad_clip)
 
-        self.loss_fn = self.get_loss() 
+        if self.args.rnn_decay_rate == 1.0:
+            lr = self.args.rnn_learning_rate
+        else:
+            lr = tf.keras.optimizers.schedules.ExponentialDecay(
+                self.args.rnn_learning_rate, self.args.rnn_epoch_steps, self.args.rnn_decay_rate
+            )
+        self.optimizer = tf.keras.optimizers.Adam(learning_rate=lr, clipvalue=self.args.rnn_grad_clip)
 
-        lstm_cell = tf.keras.layers.LSTMCell(units=args.rnn_size)
+        self.loss_fn = self.get_loss()
+        self.num_units = args.rnn_size
 
-        self.inference_base = tf.keras.layers.RNN(cell=lstm_cell, return_sequences=True, return_state=True, time_major=False)
+        # layers.LSTM can take advantage of CuDNN for a big performance boost
+        self.inference_base = tf.keras.layers.LSTM(self.num_units, return_sequences=True, return_state=True)
 
-        self.out_net = tf.keras.Sequential([
-            tf.keras.layers.InputLayer(input_shape=self.args.rnn_size),
-            tf.keras.layers.Dense(args.rnn_out_size, name="mu_logstd_logmix_net")])
+        self.predict_z = tf.keras.Sequential([
+            tf.keras.layers.Dense(args.rnn_out_size, input_shape=(self.num_units,), name="dense_z")
+        ], name="predict_z")
+        self.predict_done = tf.keras.Sequential([
+            tf.keras.layers.Dense(2, input_shape=(self.num_units,), name="dense_done")
+        ], name="predict_done") if self.args.rnn_predict_done else None
+        self.predict_reward = tf.keras.Sequential([
+            tf.keras.layers.Dense(2, input_shape=(self.num_units,), name="dense_reward")
+        ], name="predict_reward") if self.args.rnn_predict_reward else None
 
-        super(MDNRNN, self).build((self.args.rnn_batch_size, self.args.rnn_max_seq_len, self.args.rnn_input_seq_width))
+        # TODO: Is this call necessary?
+        super().build((self.args.rnn_batch_size, self.args.rnn_max_seq_len, self.args.rnn_input_seq_width))
 
+    """
+    Construct a loss functions for the MDN layer parametrised by number of mixtures.
+    """
     def get_loss(self):
-        num_mixture = self.args.rnn_num_mixture
+        # TODO: Named losses with dict
+        num_mixtures = self.args.rnn_num_mixture
         batch_size = self.args.rnn_batch_size
         z_size = self.args.z_size
-        
-        """Construct a loss functions for the MDN layer parametrised by number of mixtures."""
-        # Construct a loss function with the right number of mixtures and outputs
-        def z_loss_func(y_true, y_pred):
-            '''
-            This loss function is defined for N*k components each containing a gaussian of 1 feature
-            '''
-            mdnrnn_params = y_pred
+        losses = [masked_gaussian_mixture(num_mixtures, batch_size, z_size)]
+        if self.args.rnn_predict_done:
+            one_weight = 0.99
+            zero_weight = 0.01
+            losses.append(masked_bce(one_weight, zero_weight))
+        if self.args.rnn_predict_reward:
+            losses.append(masked_mse)
+        losses = tuple(losses) if len(losses) > 1 else losses[0]
+        return losses
 
-            y_true = tf.reshape(y_true, [batch_size, -1, z_size + 1]) # +1 for mask
-            z_true, mask = y_true[:, :, :-1], y_true[:, :, -1:]
-
-            # Reshape inputs in case this is used in a TimeDistribued layer
-            mdnrnn_params = tf.reshape(mdnrnn_params, [-1, 3*num_mixture], name='reshape_ypreds')
-            vae_z, mask = tf.reshape(z_true, [-1, 1]), tf.reshape(mask, [-1, 1])
-            
-            out_mu, out_logstd, out_logpi = tf.split(mdnrnn_params, num_or_size_splits=3, axis=1, name='mdn_coef_split')
-            out_logpi = out_logpi - tf.reduce_logsumexp(input_tensor=out_logpi, axis=1, keepdims=True) # normalize
-
-            logSqrtTwoPI = np.log(np.sqrt(2.0 * np.pi))
-            lognormal = -0.5 * ((vae_z - out_mu) / tf.exp(out_logstd)) ** 2 - out_logstd - logSqrtTwoPI
-            v = out_logpi + lognormal
-            
-            z_loss = -tf.reduce_logsumexp(input_tensor=v, axis=1, keepdims=True)
-            mask = tf.reshape(tf.tile(mask, [1, z_size]), [-1, 1]) # tile b/c we consider z_loss is flattene
-            z_loss = mask * z_loss # don't train if episode ends
-            z_loss = tf.reduce_sum(z_loss) / tf.reduce_sum(mask) 
-            return z_loss
-
-        def d_loss_func(y_true, y_pred):
-            d_pred = y_pred
-
-            y_true = tf.reshape(y_true, [batch_size, -1, 1 + 1]) # b/c tf is stupid
-            d_true, mask = y_true[:, :, :-1], y_true[:, :, -1:]
-            d_true, mask = tf.reshape(d_true, [-1, 1]), tf.reshape(mask, [-1, 1])
-            
-            d_loss = tf.expand_dims(tf.keras.losses.binary_crossentropy(y_true=d_true, y_pred=d_pred, from_logits=True), axis=-1)
-            d_loss = mask * d_loss
-            d_loss = tf.reduce_sum(d_loss) / tf.reduce_sum(mask) # mean of unmasked 
-            return d_loss
-
-        if self.args.env_name == 'DoomTakeCover-v0':
-            return z_loss_func, d_loss_func
+    def get_metrics(self):
+        if self.args.rnn_predict_done:
+            return {"output_2": [masked_bool_statistic(True, "d_one_values"),
+                                 masked_bool_statistic(False, "d_zero_values"),
+                                 masked_bool_statistic(True, "d_one_accuracy", calc_accuracy=True),
+                                 masked_bool_statistic(False, "d_zero_accuracy", calc_accuracy=True),
+                                 masked_bool_logvar("d_logvar")]}  # TODO: Named losses
         else:
-            return z_loss_func
+            return None
 
-    def set_random_params(self, stdev=0.5):
+    # Never actually called
+    def set_random_params(self, stddev=0.5):
         params = self.get_weights()
         rand_params = []
         for param_i in params:
             # David's spicy initialization scheme is wild but from preliminary experiments is critical
-            sampled_param = np.random.standard_cauchy(param_i.shape)*stdev / 10000.0 
-            rand_params.append(sampled_param) # spice things up
-          
+            sampled_param = np.random.standard_cauchy(param_i.shape) * stddev / 10000.0
+            rand_params.append(sampled_param)  # spice things up
+
         self.set_weights(rand_params)
-    
-    def call(self, inputs, training=True):
-        return self.__call__(inputs, training)
 
-    def __call__(self, inputs, training=True):
-        rnn_out, _, _ = self.inference_base(inputs)
+    def call(self, inputs, training=True, mask=None):
+        assert mask is None, 'Unsupported argument "mask"'
 
-        rnn_out = tf.reshape(rnn_out, [-1, self.args.rnn_size])
-        out = self.out_net(rnn_out)
-        if self.args.env_name == 'CarRacing-v0':
-          return out
-        else: 
-          mdnrnn_params, done_logits = out[:, :-1], out[:, -1:]
-          return mdnrnn_params, done_logits
+        # whole_seq_output,        final_memory_state, final_carry_state
+        # (batch, seq_len, units), (batch, units),     (batch, units)
+        rnn_out, _state_h, _state_c = self.inference_base(inputs)
+        # (batch * seq_len, units)
+        rnn_out = tf.reshape(rnn_out, [-1, self.num_units])
+
+        # TODO: named outputs with dict
+        outputs = [self.predict_z(rnn_out)]
+        if self.args.rnn_predict_done:
+            outputs.append(self.predict_done(rnn_out))
+        if self.args.rnn_predict_reward:
+            outputs.append(self.predict_reward(rnn_out))
+
+        if len(outputs) == 1:
+            return outputs[0]
+        else:
+            return tuple(outputs)
+
 
 @tf.function
 def rnn_next_state(rnn, z, a, prev_state):
     z = tf.cast(tf.reshape(z, [1, 1, -1]), tf.float32)
     a = tf.cast(tf.reshape(a, [1, 1, -1]), tf.float32)
     z_a = tf.concat([z, a], axis=2)
-    _, h, c = rnn.inference_base(z_a, initial_state=prev_state)
+    _rnn_out, h, c = rnn.inference_base(z_a, initial_state=prev_state)
     return [h, c]
+
 
 @tf.function
 def rnn_init_state(rnn):
-  return rnn.inference_base.cell.get_initial_state(batch_size=1, dtype=tf.float32) 
+    return rnn.inference_base.cell.get_initial_state(batch_size=1, dtype=tf.float32)
 
-def rnn_output(state, z, mode):
-  state_h, state_c = state[0], state[1]
-  if mode == MODE_ZCH:
-    return np.concatenate([z, np.concatenate((state_c,state_h), axis=1)[0]])
-  if mode == MODE_ZC:
-    return np.concatenate([z, state_c[0]])
-  if mode == MODE_ZH:
-    return np.concatenate([z, state_h[0]])
-  return z # MODE_Z or MODE_Z_HIDDEN
+
+def rnn_output(rnn_state, z, mode: FeatureMode):
+    h, c = rnn_state[0], rnn_state[1]
+
+    # rnn_state must be from a batch with a single time series (for which we want to extract features)
+    assert h.shape[0] == 1, "Tried to get features from batch > 1"
+    assert c.shape[0] == 1, "Tried to get features from batch > 1"
+    # Extract first (and only) time series in batch
+    h = h[0]
+    c = c[0]
+    # We also expect z to be a batch with one element
+    assert z.shape[0] == 1, "Expected z to be of shape (1, z_size), got " + str(z.shape)
+    z = z[0]
+
+    # Order taken from original implementation
+    outputs = []
+    if mode & FeatureMode.INCLUDE_Z:
+        outputs.append(z)
+    if mode & FeatureMode.INCLUDE_C:
+        outputs.append(c)
+    if mode & FeatureMode.INCLUDE_H:
+        outputs.append(h)
+
+    return tf.concat(outputs, axis=0).numpy()
+
+
+def rnn_output_size(rnn_state_size: int, z_size: int, mode: FeatureMode) -> int:
+    num_features = 0
+    if mode & FeatureMode.INCLUDE_Z:
+        num_features += z_size
+    if mode & FeatureMode.INCLUDE_C:
+        num_features += rnn_state_size
+    if mode & FeatureMode.INCLUDE_H:
+        num_features += rnn_state_size
+
+    return num_features
+
 
 @tf.function
-def rnn_sim(rnn, z, states, a):
-  if rnn.args.env_name == 'CarRacing-v0':
-    raise ValueError('Not implemented yet for CarRacing')
-  z = tf.reshape(tf.cast(z, dtype=tf.float32), (1, 1, rnn.args.z_size))
-  a = tf.reshape(tf.cast(a, dtype=tf.float32), (1, 1, rnn.args.a_width))
-  input_x = tf.concat((z, a), axis=2)
-  rnn_out, h, c = rnn.inference_base(input_x, initial_state=states)
-  rnn_state = [h, c]
-  rnn_out = tf.reshape(rnn_out, [-1, rnn.args.rnn_size])
-  out = rnn.out_net(rnn_out)
+def rnn_sim(rnn: MDNRNN, z, states, a):
+    # Make one LSTM step
+    z = tf.reshape(tf.cast(z, dtype=tf.float32), (1, 1, rnn.args.z_size))
+    a = tf.reshape(tf.cast(a, dtype=tf.float32), (1, 1, rnn.args.a_width))
+    input_x = tf.concat((z, a), axis=2)
+    rnn_out, h, c = rnn.inference_base(input_x, initial_state=states)
+    rnn_state = [h, c]
+    rnn_out = tf.reshape(rnn_out, [-1, rnn.args.rnn_size])
 
-  mdnrnn_params, d_logits = out[:, :-1], out[:, -1:]
-  mdnrnn_params = tf.reshape(mdnrnn_params, [-1, 3*rnn.args.rnn_num_mixture])
+    # Predict z
+    mdnrnn_params = rnn.predict_z(rnn_out)
+    mdnrnn_params = tf.reshape(mdnrnn_params, [-1, 3 * rnn.args.rnn_num_mixture])
+    mu, logstd, logpi = tf.split(mdnrnn_params, num_or_size_splits=3, axis=1)
+    logpi = logpi - tf.reduce_logsumexp(input_tensor=logpi, axis=1, keepdims=True)  # normalize
 
-  mu, logstd, logpi = tf.split(mdnrnn_params, num_or_size_splits=3, axis=1)
-  logpi = logpi - tf.reduce_logsumexp(input_tensor=logpi, axis=1, keepdims=True) # normalize
+    cat = tfd.Categorical(logits=logpi)
+    component_splits = [1] * rnn.args.rnn_num_mixture
+    mus = tf.split(mu, num_or_size_splits=component_splits, axis=1)
+    sigs = tf.split(tf.exp(logstd), num_or_size_splits=component_splits, axis=1)
+    coll = [tfd.MultivariateNormalDiag(loc=loc, scale_diag=scale) for loc, scale in zip(mus, sigs)]
+    mixture = tfd.Mixture(cat=cat, components=coll)
 
-  d_dist = tfd.Binomial(total_count=1, logits=d_logits)
-  d = tf.squeeze(d_dist.sample()) == 1.0
+    z = tf.reshape(mixture.sample(), shape=(-1, rnn.args.z_size))
 
-  cat = tfd.Categorical(logits=logpi)
-  component_splits = [1] * rnn.args.rnn_num_mixture
-  mus = tf.split(mu, num_or_size_splits=component_splits, axis=1)
-  sigs = tf.split(tf.exp(logstd), num_or_size_splits=component_splits, axis=1)
-  coll = [tfd.MultivariateNormalDiag(loc=loc, scale_diag=scale) for loc, scale in zip(mus, sigs)]
-  mixture = tfd.Mixture(cat=cat, components=coll)
+    # Predict done
+    if rnn.args.rnn_predict_done:
+        d_distr = rnn.predict_done(rnn_out)
+        done_logit = tfd.Normal(d_distr[0][0], d_distr[0][1]).sample()
+        done_dist = tfd.Binomial(total_count=1, logits=done_logit)
+        done = tf.squeeze(done_dist.sample()) == 1.0
+    else:
+        done = False
 
-  z = tf.reshape(mixture.sample(), shape=(-1, rnn.args.z_size))
+    # Predict reward
+    if rnn.args.rnn_predict_reward:
+        r_distr = rnn.predict_reward(rnn_out)
+        reward = tfd.Normal(r_distr[0][0], r_distr[0][1]).sample()
+    else:
+        reward = 1.0
 
-  r = 1.0 # For Doom Reward is always 1.0 if the agent is alive
-
-  return rnn_state, z, r, d
+    return rnn_state, z, reward, done

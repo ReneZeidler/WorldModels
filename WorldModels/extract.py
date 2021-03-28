@@ -1,88 +1,138 @@
-'''
+"""
 saves ~ 200 episodes generated from a random policy
-'''
-
-import numpy as np
-import random
+"""
 import os
+import random
+
 import gym
+import numpy as np
 
-from env import make_env
 from controller import make_controller
+from env import make_env
+from utils import PARSER, get_path
 
-from utils import PARSER
 
-args = PARSER.parse_args()
-dir_name = 'results/{}/{}/record'.format(args.exp_name, args.env_name)
-if not os.path.exists(dir_name):
-    os.makedirs(dir_name)
+def main():
+    print("Setting niceness to 19")
+    if "nice" in os.__dict__:
+        os.nice(19)
 
-controller = make_controller(args=args)
+    args = PARSER.parse_args()
 
-total_frames = 0
-env = make_env(args=args, render_mode=args.render_mode, full_episode=args.full_episode, with_obs=True, load_model=False)
+    def make_env_with_args():
+        return make_env(args=args, keep_image=True, wrap_rnn=False)
 
-for trial in range(args.max_trials):
-  try:
-    random_generated_int = random.randint(0, 2**31-1)
-    filename = dir_name+"/"+str(random_generated_int)+".npz"
-    recording_frame = []
-    recording_action = []
-    recording_reward = []
-    recording_done = []
+    dir_name = get_path(args, "record", create=True)
 
-    np.random.seed(random_generated_int)
-    env.seed(random_generated_int)
+    controller = None
+    if args.extract_use_controller:
+        controller = make_controller(args=args)
+    env = make_env_with_args()
 
-    # random policy
-    if args.env_name == 'CarRacing-v0':
-      controller.init_random_model_params(stdev=np.random.rand()*0.01)
-    else:
-      repeat = np.random.randint(1, 11)
+    has_camera_data = isinstance(env.observation_space, gym.spaces.Dict) and "camera" in env.observation_space.spaces
 
-    tot_r = 0
-    [obs, frame] = env.reset() # pixels
+    format_str = "[{success:s}] {done:s} after {frames:4d} frames, reward {reward:6.1f} " \
+                 "(Total: {total_frames:7d} frames, {successful_trials:3d}/{total_trials:3d} successful trials)"
 
-    for i in range(args.max_frames):
-      if args.render_mode:
-        env.render("human")
-      else:
-        env.render("rgb_array")
+    total_frames = 0
+    successful_trials = 0
+    for trial in range(args.max_trials):
+        try:
+            seed = random.randint(0, 2 ** 31 - 1)
+            filename = dir_name / (str(seed) + ".npz")
 
-      recording_frame.append(frame)
-      
-      if args.env_name == 'CarRacing-v0':
-        action = controller.get_action(obs)
-      else:
-        if i % repeat == 0:
-          action = np.random.rand(1,1) * 2.0 - 1.0
-          repeat = np.random.randint(1, 11)
+            np.random.seed(seed)
+            env.seed(seed)
 
-      recording_action.append(action)
+            recording_image  = []
+            recording_camera = []
+            recording_action = []
+            recording_reward = []
+            recording_done   = []
 
-      [obs, frame], reward, done, info = env.step(action)
-      tot_r += reward
+            # random policy
+            if args.extract_use_controller:
+                controller.init_random_model_params(stddev=np.random.rand() * 0.01)
+            repeat_action = np.random.randint(1, 11)
+            action = [0] * args.a_width
 
-      recording_reward.append(reward)
-      recording_done.append(done)
+            total_reward = 0
+            obs = env.reset()
 
-      if done:
-        print('total reward {}'.format(tot_r))
-        break
+            frame = 0
+            ended_early = False
+            for frame in range(args.max_frames):
+                # Save current observation
+                recording_image.append(obs["image"])
+                if has_camera_data:
+                    recording_camera.append(obs["camera"])
 
-    total_frames += (i+1)
-    print('total reward {}'.format(tot_r))
-    print("dead at", i+1, "total recorded frames for this worker", total_frames)
-    recording_frame = np.array(recording_frame, dtype=np.uint8)
-    recording_action = np.array(recording_action, dtype=np.float16)
-    recording_reward = np.array(recording_reward, dtype=np.float16)
-    recording_done = np.array(recording_done, dtype=np.bool)
-    
-    if (len(recording_frame) > args.min_frames):
-      np.savez_compressed(filename, obs=recording_frame, action=recording_action, reward=recording_reward, done=recording_done)
-  except gym.error.Error:
-    print("stupid gym error, life goes on")
+                # Get next action (random)
+                if not args.extract_repeat_actions or frame % repeat_action == 0:
+                    if args.extract_use_controller:
+                        action = controller.get_action(obs["features"])
+                    else:
+                        action = np.random.rand(args.a_width) * 2.0 - 1.0
+                    if args.extract_repeat_actions:
+                        repeat_action = np.random.randint(1, 11)
+
+                # Save action
+                recording_action.append(action)
+
+                # Perform action
+                obs, reward, done, _info = env.step(action)
+                total_reward += reward
+
+                # Save reward and done flag
+                recording_reward.append(reward)
+                recording_done.append(done)
+
+                # Stop when done
+                if done:
+                    ended_early = True
+                    break
+
+            total_frames += (frame + 1)
+            enough_frames = len(recording_image) >= args.min_frames
+
+            # Save episode to disk (if it has required minimum length)
+            if enough_frames:
+                successful_trials += 1
+
+                recording_image  = np.array(recording_image,  dtype=np.uint8  )
+                recording_camera = np.array(recording_camera, dtype=np.float16)
+                recording_action = np.array(recording_action, dtype=np.float16)
+                recording_reward = np.array(recording_reward, dtype=np.float16)
+                recording_done   = np.array(recording_done,   dtype=np.bool   )
+
+                data = {
+                    "image" : recording_image,
+                    "action": recording_action,
+                    "reward": recording_reward,
+                    "done"  : recording_done
+                }
+                if has_camera_data:
+                    data["camera"] = recording_camera
+
+                np.savez_compressed(str(filename), **data)
+
+            print(format_str.format(
+                success="O" if enough_frames else " ",
+                done="Done" if ended_early else "Stop",
+                frames=frame + 1,
+                reward=total_reward,
+                total_frames=total_frames,
+                successful_trials=successful_trials,
+                total_trials=trial + 1
+            ))
+
+        except gym.error.Error as e:
+            print("Gym raised an error: " + str(e))
+            env.close()
+            env = make_env_with_args()
+
     env.close()
-    env = make_env(args=args, render_mode=args.render_mode, full_episode=False, with_obs=True)
-    continue
-env.close()
+
+
+if __name__ == '__main__':
+    main()

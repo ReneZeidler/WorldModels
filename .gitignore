@@ -1,0 +1,6 @@
+.idea
+__pycache__
+_vizdoom.ini
+checkpoint
+ckpt*
+tensorboard
